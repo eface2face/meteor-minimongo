@@ -1,6 +1,9 @@
 {
   "name": "meteor-minimongo",
-  "repository": { "type": "git", "url": "https://github.com/eface2face/meteor-minimongo" },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/eface2face/meteor-minimongo"
+  },
   "version": "1.0.0",
   "description": "",
   "main": "minimongo.js",
@@ -8,5 +11,13 @@
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "author": "",
-  "license": "ISC"
+  "license": "ISC",
+  "dependencies": {
+    "lodash": "^2.4.1",
+    "meteor-core": "git://github.com/eface2face/meteor-core",
+    "meteor-ejson-safe": "^1.0.2",
+    "meteor-id-map": "^1.0.0",
+    "meteor-ordered-dict": "^1.0.0",
+    "meteor-tracker": "^1.0.0"
+  }
 }
