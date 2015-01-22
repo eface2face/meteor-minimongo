@@ -1,12 +1,12 @@
-var _ = require("lodash");
-var Meteor = require("meteor-core");
-var EJSON = require("meteor-ejson-safe");
-var IdMap = require("meteor-id-map");
-var OrderedDict = require("meteor-ordered-dict");
-var Tracker = require("meteor-tracker");
-var Minimongo;
-var MinimongoTest;
-var MinimongoError;
+module.requires = function(Meteor) {
+  var _ = Meteor.underscore;
+  var EJSON = Meteor.EJSON;
+  var IdMap = Meteor.IdMap;
+  var OrderedDict = Meteor.OrderedDict;
+  var Tracker = Meteor.Tracker;
+  var Minimongo;
+  var MinimongoTest;
+  var MinimongoError;
 // XXX type checking on selectors (graceful error if malformed)
 
 // LocalCollection: a set of documents that supports queries and modifiers.
@@ -3836,4 +3836,6 @@ LocalCollection._idsMatchedBySelector = function (selector) {
 EJSON.addType("oid",  function (str) {
   return new LocalCollection._ObjectID(str);
 });
-module.exports = { Minimongo: Minimongo, LocalCollection: LocalCollection};
+  Meteor.Minimongo = Minimongo;
+  Meteor.LocalCollection = LocalCollection;
+};

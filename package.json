@@ -4,7 +4,7 @@
     "type": "git",
     "url": "https://github.com/eface2face/meteor-minimongo"
   },
-  "version": "1.0.5", 
+ "version": "1.1.0",
   "description": "",
   "main": "minimongo.js",
   "scripts": {
@@ -13,8 +13,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "lodash": "^2.4.1",
-    "meteor-core": "git://github.com/eface2face/meteor-core",
+    "meteor-core": "^1.0.0",
     "meteor-ejson-safe": "^1.0.2",
     "meteor-id-map": "^1.0.0",
     "meteor-ordered-dict": "^1.0.0",
