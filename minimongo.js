@@ -1,6 +1,6 @@
 var _ = require("lodash");
 var Meteor = require("meteor-core");
-var EJSON = require("meteor-ejson");
+var EJSON = require("meteor-ejson-safe");
 var IdMap = require("meteor-id-map");
 var OrderedDict = require("meteor-ordered-dict");
 var Tracker = require("meteor-tracker");
