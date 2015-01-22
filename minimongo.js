@@ -4,6 +4,7 @@ var EJSON = require("meteor-ejson-safe");
 var IdMap = require("meteor-id-map");
 var OrderedDict = require("meteor-ordered-dict");
 var Tracker = require("meteor-tracker");
+var Minimongo;
 // XXX type checking on selectors (graceful error if malformed)
 
 // LocalCollection: a set of documents that supports queries and modifiers.
