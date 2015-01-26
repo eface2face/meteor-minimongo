@@ -4,7 +4,7 @@
     "type": "git",
     "url": "https://github.com/eface2face/meteor-minimongo"
   },
-  "version": "1.2.3",
+  "version": "1.2.4",
   "description": "",
   "main": "minimongo.js",
   "scripts": {
