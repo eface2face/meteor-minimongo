@@ -4,6 +4,7 @@ module.exports = function(Meteor) {
   var IdMap = Meteor.IdMap;
   var OrderedDict = Meteor.OrderedDict;
   var Tracker = Meteor.Tracker;
+  var Random = Meteor.Random;
   var Minimongo;
   var MinimongoTest;
   var MinimongoError;
