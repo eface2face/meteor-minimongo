@@ -8,6 +8,8 @@ module.exports = function(Meteor) {
   var Minimongo;
   var MinimongoTest;
   var MinimongoError;
+ 
+  var Package = {};
 // XXX type checking on selectors (graceful error if malformed)
 
 // LocalCollection: a set of documents that supports queries and modifiers.
@@ -49,15 +51,6 @@ Minimongo = {};
 // Object exported only for unit testing.
 // Use it to export private functions to test in Tinytest.
 MinimongoTest = {};
-
-LocalCollection._applyChanges = function (doc, changeFields) {
-  _.each(changeFields, function (value, key) {
-    if (value === undefined)
-      delete doc[key];
-    else
-      doc[key] = value;
-  });
-};
 
 MinimongoError = function (message) {
   var e = new Error(message);
@@ -102,19 +95,22 @@ LocalCollection.Cursor = function (collection, selector, options) {
 
   self.collection = collection;
   self.sorter = null;
+  self.matcher = new Minimongo.Matcher(selector);
 
   if (LocalCollection._selectorIsId(selector)) {
     // stash for fast path
     self._selectorId = selector;
-    self.matcher = new Minimongo.Matcher(selector);
+  } else if (LocalCollection._selectorIsIdPerhapsAsObject(selector)) {
+    // also do the fast path for { _id: idString }
+    self._selectorId = selector._id;
   } else {
     self._selectorId = undefined;
-    self.matcher = new Minimongo.Matcher(selector);
     if (self.matcher.hasGeoQuery() || options.sort) {
       self.sorter = new Minimongo.Sorter(options.sort || [],
                                          { matcher: self.matcher });
     }
   }
+
   self.skip = options.skip;
   self.limit = options.limit;
   self.fields = options.fields;
@@ -254,7 +250,11 @@ LocalCollection.Cursor.prototype._publishCursor = function (sub) {
   var collection = self.collection.name;
 
   // XXX minimongo should not depend on mongo-livedata!
-  return Mongo.Collection._publishCursor(self, sub, collection);
+  if (! Package.mongo) {
+    throw new Error("Can't publish from Minimongo without the `mongo` package.");
+  }
+
+  return Package.mongo.Mongo.Collection._publishCursor(self, sub, collection);
 };
 
 LocalCollection.Cursor.prototype._getCollectionName = function () {
@@ -558,7 +558,7 @@ LocalCollection.prototype.insert = function (doc, callback) {
   if (!_.has(doc, '_id')) {
     // if you really want to use ObjectIDs, set this global.
     // Mongo.Collection specifies its own ids and does not use this code.
-    doc._id = LocalCollection._useOID ? new LocalCollection._ObjectID()
+    doc._id = LocalCollection._useOID ? new MongoID.ObjectID()
                                       : Random.id();
   }
   var id = doc._id;
@@ -709,11 +709,51 @@ LocalCollection.prototype.update = function (selector, mod, options, callback) {
   // they already have a resultsSnapshot and we won't be diffing in
   // _recomputeResults.)
   var qidToOriginalResults = {};
+  // We should only clone each document once, even if it appears in multiple queries
+  var docMap = new LocalCollection._IdMap;
+  var idsMatchedBySelector = LocalCollection._idsMatchedBySelector(selector);
+
   _.each(self.queries, function (query, qid) {
-    // XXX for now, skip/limit implies ordered observe, so query.results is
-    // always an array
-    if ((query.cursor.skip || query.cursor.limit) && ! self.paused)
-      qidToOriginalResults[qid] = EJSON.clone(query.results);
+    if ((query.cursor.skip || query.cursor.limit) && ! self.paused) {
+      // Catch the case of a reactive `count()` on a cursor with skip
+      // or limit, which registers an unordered observe. This is a
+      // pretty rare case, so we just clone the entire result set with
+      // no optimizations for documents that appear in these result
+      // sets and other queries.
+      if (query.results instanceof LocalCollection._IdMap) {
+        qidToOriginalResults[qid] = query.results.clone();
+        return;
+      }
+
+      if (!(query.results instanceof Array)) {
+        throw new Error("Assertion failed: query.results not an array");
+      }
+
+      // Clones a document to be stored in `qidToOriginalResults`
+      // because it may be modified before the new and old result sets
+      // are diffed. But if we know exactly which document IDs we're
+      // going to modify, then we only need to clone those.
+      var memoizedCloneIfNeeded = function(doc) {
+        if (docMap.has(doc._id)) {
+          return docMap.get(doc._id);
+        } else {
+          var docToMemoize;
+
+          if (idsMatchedBySelector && !_.any(idsMatchedBySelector, function(id) {
+            return EJSON.equals(id, doc._id);
+          })) {
+            docToMemoize = doc;
+          } else {
+            docToMemoize = EJSON.clone(doc);
+          }
+
+          docMap.set(doc._id, docToMemoize);
+          return docToMemoize;
+        }
+      };
+
+      qidToOriginalResults[qid] = query.results.map(memoizedCloneIfNeeded);
+    }
   });
   var recomputeQids = {};
 
@@ -883,7 +923,7 @@ LocalCollection._updateInResults = function (query, doc, old_doc) {
   if (!EJSON.equals(doc._id, old_doc._id))
     throw new Error("Can't change a doc's _id while updating");
   var projectionFn = query.projectionFn;
-  var changedFields = LocalCollection._makeChangedFields(
+  var changedFields = DiffSequence.makeChangedFields(
     projectionFn(doc), projectionFn(old_doc));
 
   if (!query.ordered) {
@@ -1061,65 +1101,6 @@ LocalCollection.prototype.resumeObservers = function () {
   self._observeQueue.drain();
 };
 
-
-// NB: used by livedata
-LocalCollection._idStringify = function (id) {
-  if (id instanceof LocalCollection._ObjectID) {
-    return id.valueOf();
-  } else if (typeof id === 'string') {
-    if (id === "") {
-      return id;
-    } else if (id.substr(0, 1) === "-" || // escape previously dashed strings
-               id.substr(0, 1) === "~" || // escape escaped numbers, true, false
-               LocalCollection._looksLikeObjectID(id) || // escape object-id-form strings
-               id.substr(0, 1) === '{') { // escape object-form strings, for maybe implementing later
-      return "-" + id;
-    } else {
-      return id; // other strings go through unchanged.
-    }
-  } else if (id === undefined) {
-    return '-';
-  } else if (typeof id === 'object' && id !== null) {
-    throw new Error("Meteor does not currently support objects other than ObjectID as ids");
-  } else { // Numbers, true, false, null
-    return "~" + JSON.stringify(id);
-  }
-};
-
-
-// NB: used by livedata
-LocalCollection._idParse = function (id) {
-  if (id === "") {
-    return id;
-  } else if (id === '-') {
-    return undefined;
-  } else if (id.substr(0, 1) === '-') {
-    return id.substr(1);
-  } else if (id.substr(0, 1) === '~') {
-    return JSON.parse(id.substr(1));
-  } else if (LocalCollection._looksLikeObjectID(id)) {
-    return new LocalCollection._ObjectID(id);
-  } else {
-    return id;
-  }
-};
-
-LocalCollection._makeChangedFields = function (newDoc, oldDoc) {
-  var fields = {};
-  LocalCollection._diffObjects(oldDoc, newDoc, {
-    leftOnly: function (key, value) {
-      fields[key] = undefined;
-    },
-    rightOnly: function (key, value) {
-      fields[key] = value;
-    },
-    both: function (key, leftValue, rightValue) {
-      if (!EJSON.equals(leftValue, rightValue))
-        fields[key] = rightValue;
-    }
-  });
-  return fields;
-};
 // Wrap a transform function to return objects that have the _id field
 // of the untransformed document. This ensures that subsystems such as
 // the observe-sequence package that call `observe` can keep track of
@@ -1894,7 +1875,7 @@ ELEMENT_OPERATORS = {
         throw Error("$elemMatch need an object");
 
       var subMatcher, isDocMatcher;
-      if (isOperatorObject(operand, true)) {
+      if (isOperatorObject(_.omit(operand, _.keys(LOGICAL_OPERATORS)), true)) {
         subMatcher = compileValueSelector(operand, matcher);
         isDocMatcher = false;
       } else {
@@ -2203,7 +2184,7 @@ LocalCollection._f = {
       return 9;
     if (EJSON.isBinary(v))
       return 5;
-    if (v instanceof LocalCollection._ObjectID)
+    if (v instanceof MongoID.ObjectID)
       return 7;
     return 3; // object
 
@@ -2370,6 +2351,7 @@ Minimongo.Sorter = function (spec, options) {
   options = options || {};
 
   self._sortSpecParts = [];
+  self._sortFunction = null;
 
   var addSpecPart = function (path, ascending) {
     if (!path)
@@ -2395,9 +2377,15 @@ Minimongo.Sorter = function (spec, options) {
     _.each(spec, function (value, key) {
       addSpecPart(key, value >= 0);
     });
+  } else if (typeof spec === "function") {
+    self._sortFunction = spec;
   } else {
     throw Error("Bad sort specification: " + JSON.stringify(spec));
   }
+
+  // If a function is specified for sorting, we skip the rest.
+  if (self._sortFunction)
+    return;
 
   // To implement affectedByModifier, we piggy-back on top of Matcher's
   // affectedByModifier code; we create a selector that is affected by the same
@@ -2621,6 +2609,9 @@ _.extend(Minimongo.Sorter.prototype, {
   _getBaseComparator: function () {
     var self = this;
 
+    if (self._sortFunction)
+      return self._sortFunction;
+
     // If we're only sorting on geoquery distance and no specs, just say
     // everything is equal.
     if (!self._sortSpecParts.length) {
@@ -2819,10 +2810,15 @@ projectionDetails = function (fields) {
   // like 'foo' and 'foo.bar' can assume that 'foo' comes first.
   var fieldsKeys = _.keys(fields).sort();
 
-  // If there are other rules other than '_id', treat '_id' differently in a
-  // separate case. If '_id' is the only rule, use it to understand if it is
-  // including/excluding projection.
-  if (fieldsKeys.length > 0 && !(fieldsKeys.length === 1 && fieldsKeys[0] === '_id'))
+  // If _id is the only field in the projection, do not remove it, since it is
+  // required to determine if this is an exclusion or exclusion. Also keep an
+  // inclusive _id, since inclusive _id follows the normal rules about mixing
+  // inclusive and exclusive fields. If _id is not the only field in the
+  // projection and is exclusive, remove it so it can be handled later by a
+  // special case, since exclusive _id is always allowed.
+  if (fieldsKeys.length > 0 &&
+      !(fieldsKeys.length === 1 && fieldsKeys[0] === '_id') &&
+      !(_.contains(fieldsKeys, '_id') && fields['_id']))
     fieldsKeys = _.reject(fieldsKeys, function (key) { return key === '_id'; });
 
   var including = null; // Unknown
@@ -2832,7 +2828,7 @@ projectionDetails = function (fields) {
     if (including === null)
       including = rule;
     if (including !== rule)
-      // This error message is copies from MongoDB shell
+      // This error message is copied from MongoDB shell
       throw MinimongoError("You cannot currently mix including and excluding fields.");
   });
 
@@ -2922,11 +2918,12 @@ LocalCollection._checkSupportedProjection = function (fields) {
   _.each(fields, function (val, keyPath) {
     if (_.contains(keyPath.split('.'), '$'))
       throw MinimongoError("Minimongo doesn't support $ operator in projections yet.");
+    if (typeof val === 'object' && _.intersection(['$elemMatch', '$meta', '$slice'], _.keys(val)).length > 0)
+      throw MinimongoError("Minimongo doesn't support operators in projections yet.");
     if (_.indexOf([1, 0, true, false], val) === -1)
       throw MinimongoError("Projection values should be one of 1, 0, true, or false");
   });
 };
-
 // XXX need a strategy for passing the binding of $ into this
 // function, from the compiled selector
 //
@@ -2943,6 +2940,10 @@ LocalCollection._modify = function (doc, mod, options) {
   options = options || {};
   if (!isPlainObject(mod))
     throw MinimongoError("Modifier must be an object");
+
+  // Make sure the caller can't mutate our data structures.
+  mod = EJSON.clone(mod);
+
   var isModifier = isOperatorObject(mod);
 
   var newDoc;
@@ -3129,7 +3130,7 @@ var MODIFIERS = {
       e.setPropertyError = true;
       throw e;
     }
-    target[field] = EJSON.clone(arg);
+    target[field] = arg;
   },
   $setOnInsert: function (target, field, arg) {
     // converted to `$set` in `_modify`
@@ -3151,14 +3152,25 @@ var MODIFIERS = {
 
     if (!(arg && arg.$each)) {
       // Simple mode: not $each
-      target[field].push(EJSON.clone(arg));
+      target[field].push(arg);
       return;
     }
 
-    // Fancy mode: $each (and maybe $slice and $sort)
+    // Fancy mode: $each (and maybe $slice and $sort and $position)
     var toPush = arg.$each;
     if (!(toPush instanceof Array))
       throw MinimongoError("$each must be an array");
+
+    // Parse $position
+    var position = undefined;
+    if ('$position' in arg) {
+      if (typeof arg.$position !== "number")
+        throw MinimongoError("$position must be a numeric value");
+      // XXX should check to make sure integer
+      if (arg.$position < 0)
+        throw MinimongoError("$position in $push must be zero or positive");
+      position = arg.$position;
+    }
 
     // Parse $slice.
     var slice = undefined;
@@ -3190,8 +3202,15 @@ var MODIFIERS = {
     }
 
     // Actually push.
-    for (var j = 0; j < toPush.length; j++)
-      target[field].push(EJSON.clone(toPush[j]));
+    if (position === undefined) {
+      for (var j = 0; j < toPush.length; j++)
+        target[field].push(toPush[j]);
+    } else {
+      var spliceArguments = [position, 0];
+      for (var j = 0; j < toPush.length; j++)
+        spliceArguments.push(toPush[j]);
+      Array.prototype.splice.apply(target[field], spliceArguments);
+    }
 
     // Actually sort.
     if (sortFunction)
@@ -3239,7 +3258,7 @@ var MODIFIERS = {
         for (var i = 0; i < x.length; i++)
           if (LocalCollection._f._equal(value, x[i]))
             return;
-        x.push(EJSON.clone(value));
+        x.push(value);
       });
     }
   },
@@ -3268,7 +3287,7 @@ var MODIFIERS = {
       throw MinimongoError("Cannot apply $pull/pullAll modifier to non-array");
     else {
       var out = [];
-      if (typeof arg === "object" && !(arg instanceof Array)) {
+      if (arg != null && typeof arg === "object" && !(arg instanceof Array)) {
         // XXX would be much nicer to compile this once, rather than
         // for each document we modify.. but usually we're not
         // modifying that many documents, so we'll let it slide for
@@ -3346,226 +3365,26 @@ var MODIFIERS = {
 // old_results and new_results: collections of documents.
 //    if ordered, they are arrays.
 //    if unordered, they are IdMaps
-LocalCollection._diffQueryChanges = function (ordered, oldResults, newResults,
-                                              observer, options) {
-  if (ordered)
-    LocalCollection._diffQueryOrderedChanges(
-      oldResults, newResults, observer, options);
-  else
-    LocalCollection._diffQueryUnorderedChanges(
-      oldResults, newResults, observer, options);
+LocalCollection._diffQueryChanges = function (ordered, oldResults, newResults, observer, options) {
+  return DiffSequence.diffQueryChanges(ordered, oldResults, newResults, observer, options);
 };
 
-LocalCollection._diffQueryUnorderedChanges = function (oldResults, newResults,
-                                                       observer, options) {
-  options = options || {};
-  var projectionFn = options.projectionFn || EJSON.clone;
-
-  if (observer.movedBefore) {
-    throw new Error("_diffQueryUnordered called with a movedBefore observer!");
-  }
-
-  newResults.forEach(function (newDoc, id) {
-    var oldDoc = oldResults.get(id);
-    if (oldDoc) {
-      if (observer.changed && !EJSON.equals(oldDoc, newDoc)) {
-        var projectedNew = projectionFn(newDoc);
-        var projectedOld = projectionFn(oldDoc);
-        var changedFields =
-              LocalCollection._makeChangedFields(projectedNew, projectedOld);
-        if (! _.isEmpty(changedFields)) {
-          observer.changed(id, changedFields);
-        }
-      }
-    } else if (observer.added) {
-      var fields = projectionFn(newDoc);
-      delete fields._id;
-      observer.added(newDoc._id, fields);
-    }
-  });
-
-  if (observer.removed) {
-    oldResults.forEach(function (oldDoc, id) {
-      if (!newResults.has(id))
-        observer.removed(id);
-    });
-  }
+LocalCollection._diffQueryUnorderedChanges = function (oldResults, newResults, observer, options) {
+  return DiffSequence.diffQueryUnorderedChanges(oldResults, newResults, observer, options);
 };
 
 
-LocalCollection._diffQueryOrderedChanges = function (old_results, new_results,
-                                                     observer, options) {
-  options = options || {};
-  var projectionFn = options.projectionFn || EJSON.clone;
-
-  var new_presence_of_id = {};
-  _.each(new_results, function (doc) {
-    if (new_presence_of_id[doc._id])
-      Meteor._debug("Duplicate _id in new_results");
-    new_presence_of_id[doc._id] = true;
-  });
-
-  var old_index_of_id = {};
-  _.each(old_results, function (doc, i) {
-    if (doc._id in old_index_of_id)
-      Meteor._debug("Duplicate _id in old_results");
-    old_index_of_id[doc._id] = i;
-  });
-
-  // ALGORITHM:
-  //
-  // To determine which docs should be considered "moved" (and which
-  // merely change position because of other docs moving) we run
-  // a "longest common subsequence" (LCS) algorithm.  The LCS of the
-  // old doc IDs and the new doc IDs gives the docs that should NOT be
-  // considered moved.
-
-  // To actually call the appropriate callbacks to get from the old state to the
-  // new state:
-
-  // First, we call removed() on all the items that only appear in the old
-  // state.
-
-  // Then, once we have the items that should not move, we walk through the new
-  // results array group-by-group, where a "group" is a set of items that have
-  // moved, anchored on the end by an item that should not move.  One by one, we
-  // move each of those elements into place "before" the anchoring end-of-group
-  // item, and fire changed events on them if necessary.  Then we fire a changed
-  // event on the anchor, and move on to the next group.  There is always at
-  // least one group; the last group is anchored by a virtual "null" id at the
-  // end.
-
-  // Asymptotically: O(N k) where k is number of ops, or potentially
-  // O(N log N) if inner loop of LCS were made to be binary search.
-
-
-  //////// LCS (longest common sequence, with respect to _id)
-  // (see Wikipedia article on Longest Increasing Subsequence,
-  // where the LIS is taken of the sequence of old indices of the
-  // docs in new_results)
-  //
-  // unmoved: the output of the algorithm; members of the LCS,
-  // in the form of indices into new_results
-  var unmoved = [];
-  // max_seq_len: length of LCS found so far
-  var max_seq_len = 0;
-  // seq_ends[i]: the index into new_results of the last doc in a
-  // common subsequence of length of i+1 <= max_seq_len
-  var N = new_results.length;
-  var seq_ends = new Array(N);
-  // ptrs:  the common subsequence ending with new_results[n] extends
-  // a common subsequence ending with new_results[ptr[n]], unless
-  // ptr[n] is -1.
-  var ptrs = new Array(N);
-  // virtual sequence of old indices of new results
-  var old_idx_seq = function(i_new) {
-    return old_index_of_id[new_results[i_new]._id];
-  };
-  // for each item in new_results, use it to extend a common subsequence
-  // of length j <= max_seq_len
-  for(var i=0; i<N; i++) {
-    if (old_index_of_id[new_results[i]._id] !== undefined) {
-      var j = max_seq_len;
-      // this inner loop would traditionally be a binary search,
-      // but scanning backwards we will likely find a subseq to extend
-      // pretty soon, bounded for example by the total number of ops.
-      // If this were to be changed to a binary search, we'd still want
-      // to scan backwards a bit as an optimization.
-      while (j > 0) {
-        if (old_idx_seq(seq_ends[j-1]) < old_idx_seq(i))
-          break;
-        j--;
-      }
-
-      ptrs[i] = (j === 0 ? -1 : seq_ends[j-1]);
-      seq_ends[j] = i;
-      if (j+1 > max_seq_len)
-        max_seq_len = j+1;
-    }
-  }
-
-  // pull out the LCS/LIS into unmoved
-  var idx = (max_seq_len === 0 ? -1 : seq_ends[max_seq_len-1]);
-  while (idx >= 0) {
-    unmoved.push(idx);
-    idx = ptrs[idx];
-  }
-  // the unmoved item list is built backwards, so fix that
-  unmoved.reverse();
-
-  // the last group is always anchored by the end of the result list, which is
-  // an id of "null"
-  unmoved.push(new_results.length);
-
-  _.each(old_results, function (doc) {
-    if (!new_presence_of_id[doc._id])
-      observer.removed && observer.removed(doc._id);
-  });
-  // for each group of things in the new_results that is anchored by an unmoved
-  // element, iterate through the things before it.
-  var startOfGroup = 0;
-  _.each(unmoved, function (endOfGroup) {
-    var groupId = new_results[endOfGroup] ? new_results[endOfGroup]._id : null;
-    var oldDoc, newDoc, fields, projectedNew, projectedOld;
-    for (var i = startOfGroup; i < endOfGroup; i++) {
-      newDoc = new_results[i];
-      if (!_.has(old_index_of_id, newDoc._id)) {
-        fields = projectionFn(newDoc);
-        delete fields._id;
-        observer.addedBefore && observer.addedBefore(newDoc._id, fields, groupId);
-        observer.added && observer.added(newDoc._id, fields);
-      } else {
-        // moved
-        oldDoc = old_results[old_index_of_id[newDoc._id]];
-        projectedNew = projectionFn(newDoc);
-        projectedOld = projectionFn(oldDoc);
-        fields = LocalCollection._makeChangedFields(projectedNew, projectedOld);
-        if (!_.isEmpty(fields)) {
-          observer.changed && observer.changed(newDoc._id, fields);
-        }
-        observer.movedBefore && observer.movedBefore(newDoc._id, groupId);
-      }
-    }
-    if (groupId) {
-      newDoc = new_results[endOfGroup];
-      oldDoc = old_results[old_index_of_id[newDoc._id]];
-      projectedNew = projectionFn(newDoc);
-      projectedOld = projectionFn(oldDoc);
-      fields = LocalCollection._makeChangedFields(projectedNew, projectedOld);
-      if (!_.isEmpty(fields)) {
-        observer.changed && observer.changed(newDoc._id, fields);
-      }
-    }
-    startOfGroup = endOfGroup+1;
-  });
-
-
+LocalCollection._diffQueryOrderedChanges =
+  function (oldResults, newResults, observer, options) {
+  return DiffSequence.diffQueryOrderedChanges(oldResults, newResults, observer, options);
 };
 
-
-// General helper for diff-ing two objects.
-// callbacks is an object like so:
-// { leftOnly: function (key, leftValue) {...},
-//   rightOnly: function (key, rightValue) {...},
-//   both: function (key, leftValue, rightValue) {...},
-// }
 LocalCollection._diffObjects = function (left, right, callbacks) {
-  _.each(left, function (leftValue, key) {
-    if (_.has(right, key))
-      callbacks.both && callbacks.both(key, leftValue, right[key]);
-    else
-      callbacks.leftOnly && callbacks.leftOnly(key, leftValue);
-  });
-  if (callbacks.rightOnly) {
-    _.each(right, function(rightValue, key) {
-      if (!_.has(left, key))
-        callbacks.rightOnly(key, rightValue);
-    });
-  }
+  return DiffSequence.diffObjects(left, right, callbacks);
 };
 LocalCollection._IdMap = function () {
   var self = this;
-  IdMap.call(self, LocalCollection._idStringify, LocalCollection._idParse);
+  IdMap.call(self, MongoID.idStringify, MongoID.idParse);
 };
 
 Meteor._inherits(LocalCollection._IdMap, IdMap);
@@ -3597,7 +3416,7 @@ LocalCollection._CachingChangeObserver = function (options) {
   var callbacks = options.callbacks || {};
 
   if (self.ordered) {
-    self.docs = new OrderedDict(LocalCollection._idStringify);
+    self.docs = new OrderedDict(MongoID.idStringify);
     self.applyChange = {
       addedBefore: function (id, fields, before) {
         var doc = EJSON.clone(fields);
@@ -3637,7 +3456,7 @@ LocalCollection._CachingChangeObserver = function (options) {
       throw new Error("Unknown id for changed: " + id);
     callbacks.changed && callbacks.changed.call(
       self, id, EJSON.clone(fields));
-    LocalCollection._applyChanges(doc, fields);
+    DiffSequence.applyChanges(doc, fields);
   };
   self.applyChange.removed = function (id) {
     callbacks.removed && callbacks.removed.call(self, id);
@@ -3678,7 +3497,7 @@ LocalCollection._observeFromObserveChanges = function (cursor, observeCallbacks)
         if (!doc)
           throw new Error("Unknown id for changed: " + id);
         var oldDoc = transform(EJSON.clone(doc));
-        LocalCollection._applyChanges(doc, fields);
+        DiffSequence.applyChanges(doc, fields);
         doc = transform(doc);
         if (observeCallbacks.changedAt) {
           var index = indices ? self.docs.indexOf(id) : -1;
@@ -3730,7 +3549,7 @@ LocalCollection._observeFromObserveChanges = function (cursor, observeCallbacks)
         if (observeCallbacks.changed) {
           var oldDoc = self.docs.get(id);
           var doc = EJSON.clone(oldDoc);
-          LocalCollection._applyChanges(doc, fields);
+          DiffSequence.applyChanges(doc, fields);
           observeCallbacks.changed(transform(doc),
                                    transform(EJSON.clone(oldDoc)));
         }
@@ -3751,60 +3570,11 @@ LocalCollection._observeFromObserveChanges = function (cursor, observeCallbacks)
 
   return handle;
 };
-LocalCollection._looksLikeObjectID = function (str) {
-  return str.length === 24 && str.match(/^[0-9a-f]*$/);
-};
-
-LocalCollection._ObjectID = function (hexString) {
-  //random-based impl of Mongo ObjectID
-  var self = this;
-  if (hexString) {
-    hexString = hexString.toLowerCase();
-    if (!LocalCollection._looksLikeObjectID(hexString)) {
-      throw new Error("Invalid hexadecimal string for creating an ObjectID");
-    }
-    // meant to work with _.isEqual(), which relies on structural equality
-    self._str = hexString;
-  } else {
-    self._str = Random.hexString(24);
-  }
-};
-
-LocalCollection._ObjectID.prototype.toString = function () {
-  var self = this;
-  return "ObjectID(\"" + self._str + "\")";
-};
-
-LocalCollection._ObjectID.prototype.equals = function (other) {
-  var self = this;
-  return other instanceof LocalCollection._ObjectID &&
-    self.valueOf() === other.valueOf();
-};
-
-LocalCollection._ObjectID.prototype.clone = function () {
-  var self = this;
-  return new LocalCollection._ObjectID(self._str);
-};
-
-LocalCollection._ObjectID.prototype.typeName = function() {
-  return "oid";
-};
-
-LocalCollection._ObjectID.prototype.getTimestamp = function() {
-  var self = this;
-  return parseInt(self._str.substr(0, 8), 16);
-};
-
-LocalCollection._ObjectID.prototype.valueOf =
-    LocalCollection._ObjectID.prototype.toJSONValue =
-    LocalCollection._ObjectID.prototype.toHexString =
-    function () { return this._str; };
-
 // Is this selector just shorthand for lookup by _id?
 LocalCollection._selectorIsId = function (selector) {
   return (typeof selector === "string") ||
     (typeof selector === "number") ||
-    selector instanceof LocalCollection._ObjectID;
+    selector instanceof MongoID.ObjectID;
 };
 
 // Is the selector just lookup by _id (shorthand or not)?
@@ -3856,9 +3626,8 @@ LocalCollection._idsMatchedBySelector = function (selector) {
   return null;
 };
 
-EJSON.addType("oid",  function (str) {
-  return new LocalCollection._ObjectID(str);
-});
+
   Meteor.Minimongo = Minimongo;
+  Meteor.MinimongoTest = MinimongoTest;
   Meteor.LocalCollection = LocalCollection;
 };
