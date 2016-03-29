@@ -10,6 +10,9 @@ module.exports = function(Meteor) {
   var MinimongoError;
  
   var Package = {};
+
+  //Don't sport to global
+  var LocalCollection,isArray,isPlainObject,isIndexable,isOperatorObject,isNumericKey,regexpElementMatcher,equalityElementMatcher,ELEMENT_OPERATORS,makeLookupFunction,expandArraysInBranches,projectionDetails,pathsToTree;
 // XXX type checking on selectors (graceful error if malformed)
 
 // LocalCollection: a set of documents that supports queries and modifiers.
